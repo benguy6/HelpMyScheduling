@@ -317,35 +317,50 @@ async function checkConflicts(chatId, date, startTime, endTime) {
 async function scheduleReminder(chatId, event) {
   if (!event.start_time) return;
 
-  const settings = await db.get('SELECT * FROM settings WHERE chat_id = ?', chatId);
-  const reminderMinutes = settings?.default_reminder_minutes ?? 30;
-
   const eventDateTime = new Date(`${event.date}T${event.start_time}:00`);
-  const reminderTime = new Date(eventDateTime.getTime() - reminderMinutes * 60 * 1000);
+  const icon = getEventIcon(event.type);
+  const timeLabel = event.end_time ? `${event.start_time}-${event.end_time}` : event.start_time;
 
-  if (reminderTime <= new Date()) return;
+  // Schedule 3 reminders: 1 day before, 6 hours before, and 30 minutes before
+  const reminderOffsets = [
+    { minutes: 24 * 60, label: '1 day' },      // 1 day = 1440 minutes
+    { minutes: 6 * 60, label: '6 hours' },     // 6 hours = 360 minutes
+    { minutes: 30, label: '30 minutes' }       // 30 minutes
+  ];
 
-  const job = schedule.scheduleJob(reminderTime, async () => {
-    const icon = getEventIcon(event.type);
-    const timeLabel = event.end_time ? `${event.start_time}-${event.end_time}` : event.start_time;
+  for (const offset of reminderOffsets) {
+    const reminderTime = new Date(eventDateTime.getTime() - offset.minutes * 60 * 1000);
 
-    await bot.sendMessage(
-      chatId,
-      `🔔 *Reminder*\n\n${icon} ${escapeMarkdown(event.task)}\n⏰ ${escapeMarkdown(timeLabel)}\n\nStarting in ${reminderMinutes} minutes!`,
-      { parse_mode: 'Markdown' }
-    );
+    // Only schedule if reminder time is in the future
+    if (reminderTime > new Date()) {
+      const jobKey = `${event.id}-${offset.minutes}`;
+      
+      const job = schedule.scheduleJob(reminderTime, async () => {
+        await bot.sendMessage(
+          chatId,
+          `🔔 *Reminder* (${offset.label} before)\n\n${icon} ${escapeMarkdown(event.task)}\n📅 ${escapeMarkdown(formatDate(event.date))}\n⏰ ${escapeMarkdown(timeLabel)}`,
+          { parse_mode: 'Markdown' }
+        );
 
-    reminderJobs.delete(event.id);
-  });
+        reminderJobs.delete(jobKey);
+      });
 
-  reminderJobs.set(event.id, job);
+      reminderJobs.set(jobKey, job);
+    }
+  }
 }
 
 function cancelReminder(eventId) {
-  const job = reminderJobs.get(eventId);
-  if (job) {
-    job.cancel();
-    reminderJobs.delete(eventId);
+  // Cancel all reminders for this event (1 day, 6 hours, 30 minutes)
+  const offsets = [24 * 60, 6 * 60, 30];
+  
+  for (const offset of offsets) {
+    const jobKey = `${eventId}-${offset}`;
+    const job = reminderJobs.get(jobKey);
+    if (job) {
+      job.cancel();
+      reminderJobs.delete(jobKey);
+    }
   }
 }
 
