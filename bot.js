@@ -10,6 +10,7 @@ const OpenAI = require('openai');
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const schedule = require('node-schedule');
+const ical = require('node-ical');
 
 // =====================================================
 // CONFIG
@@ -91,7 +92,20 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_school_timetable_chat_day ON school_timetable(chat_id, day_of_week);
   `);
 
+  // Add new columns for week restrictions (migration)
+  await addColumnIfNotExists('school_timetable', 'weeks_json TEXT');
+  await addColumnIfNotExists('settings', 'semester_start_date TEXT');
+
   console.log('✅ Database initialized');
+}
+
+async function addColumnIfNotExists(table, columnDef) {
+  try {
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef};`);
+  } catch (e) {
+    // ignore "duplicate column name"
+    if (!String(e.message || '').toLowerCase().includes('duplicate column name')) throw e;
+  }
 }
 
 // =====================================================
@@ -100,7 +114,7 @@ async function initDatabase() {
 const DRAFT_TTL_MS = 90 * 1000; // 90 seconds
 const CONFIRM_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-// chatId -> { drafts: [ {id, draft, state, updatedAt, overwriteNext} ], updatedAt, editingEventId, editingField, addingClass }
+// chatId -> { drafts: [...], updatedAt, editingEventId, editingField, addingClass, importingTimetable, pendingTimetableImport }
 const sessions = new Map();
 
 // Scheduled reminder jobs
@@ -112,7 +126,15 @@ function nowMs() {
 
 function getSession(chatId) {
   if (!sessions.has(chatId)) {
-    sessions.set(chatId, { drafts: [], updatedAt: nowMs(), editingEventId: null, editingField: null, addingClass: false });
+    sessions.set(chatId, {
+      drafts: [],
+      updatedAt: nowMs(),
+      editingEventId: null,
+      editingField: null,
+      addingClass: false,
+      importingTimetable: false,
+      pendingTimetableImport: null
+    });
   }
   return sessions.get(chatId);
 }
@@ -318,14 +340,15 @@ async function updateEvent(chatId, eventId, updates) {
 // =====================================================
 async function addSchoolTimetableEntry(chatId, entry) {
   const result = await db.run(
-    `INSERT INTO school_timetable (chat_id, subject, day_of_week, start_time, end_time, location, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO school_timetable (chat_id, subject, day_of_week, start_time, end_time, location, weeks_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     chatId,
     entry.subject,
     entry.day_of_week,
     entry.start_time,
     entry.end_time,
     entry.location || null,
+    entry.weeks_json || null,
     new Date().toISOString()
   );
 
@@ -336,7 +359,8 @@ async function addSchoolTimetableEntry(chatId, entry) {
     day_of_week: entry.day_of_week,
     start_time: entry.start_time,
     end_time: entry.end_time,
-    location: entry.location || null
+    location: entry.location || null,
+    weeks_json: entry.weeks_json || null
   };
 }
 
@@ -353,13 +377,39 @@ async function getSchoolTimetableForDate(chatId, dateStr) {
   const date = new Date(dateStr);
   const dayOfWeek = date.getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
   
-  return db.all(
+  const entries = await db.all(
     `SELECT * FROM school_timetable 
      WHERE chat_id = ? AND day_of_week = ? 
      ORDER BY start_time`,
     chatId,
     dayOfWeek
   );
+
+  // Filter by weeks if needed
+  const settings = await db.get('SELECT semester_start_date FROM settings WHERE chat_id = ?', chatId);
+  const semStart = settings?.semester_start_date;
+
+  const filtered = [];
+  for (const entry of entries) {
+    if (!entry.weeks_json) {
+      // Weekly class - always include
+      filtered.push(entry);
+    } else {
+      // Irregular class - check if this week is included
+      if (!semStart) {
+        // No semester start date - include as fallback
+        filtered.push(entry);
+      } else {
+        const weeks = JSON.parse(entry.weeks_json);
+        const wk = weekNumber(new Date(dateStr), semStart);
+        if (wk && weeks.includes(wk)) {
+          filtered.push(entry);
+        }
+      }
+    }
+  }
+
+  return filtered;
 }
 
 async function deleteSchoolTimetableEntry(chatId, entryId) {
@@ -373,6 +423,23 @@ async function clearSchoolTimetable(chatId) {
 function getDayName(dayOfWeek) {
   const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   return days[dayOfWeek];
+}
+
+function mondayOfWeek(d) {
+  const x = new Date(d);
+  const day = x.getDay(); // 0 Sun..6 Sat
+  const diff = (day === 0 ? -6 : 1 - day); // shift to Monday
+  x.setDate(x.getDate() + diff);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function weekNumber(dateObj, semesterStartDateStr) {
+  if (!semesterStartDateStr) return null;
+  const start = new Date(`${semesterStartDateStr}T00:00:00`);
+  const dMon = mondayOfWeek(dateObj);
+  const deltaDays = Math.round((dMon - start) / (1000 * 60 * 60 * 24));
+  return Math.floor(deltaDays / 7) + 1;
 }
 
 function parseDayOfWeek(dayStr) {
@@ -629,6 +696,203 @@ function buildConflictKeyboard(draftId) {
   };
 }
 
+function buildTimetableImportKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Replace & Import', callback_data: 'timetable_import:replace' },
+        { text: '➕ Merge', callback_data: 'timetable_import:merge' }
+      ],
+      [{ text: '❌ Cancel', callback_data: 'timetable_import:cancel' }]
+    ]
+  };
+}
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function timeFromDateLocal(d) {
+  // Since your bot runs on your laptop, this uses laptop local timezone (SG).
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+function makeSubjectModulePlusType(summary) {
+  // Expected NUSMods SUMMARY like "CS2113 Tutorial", "CG2023 Lecture", "MNO2711 Sectional Teaching"
+  // We keep "MODULECODE + CLASSTYPE". If it doesn't match, fall back to full summary.
+  const s = String(summary || '').trim();
+  const m = s.match(/^([A-Z]{2,4}\d{4}[A-Z]?)\s+(.+)$/);
+  if (!m) return s || 'Unknown Class';
+  const code = m[1].trim();
+  const type = m[2].trim();
+  return `${code} ${type}`;
+}
+
+function collectExdateSet(ev) {
+  // node-ical can represent EXDATE in a few ways:
+  // - ev.exdate as an object: { '20260120T080000Z': Date, ... }
+  // - ev.exdate as an array of Dates
+  // - ev.exdate as a single Date
+  const set = new Set();
+  const ex = ev.exdate;
+
+  if (!ex) return set;
+
+  if (ex instanceof Date) {
+    set.add(ex.toISOString());
+    return set;
+  }
+
+  if (Array.isArray(ex)) {
+    for (const d of ex) if (d instanceof Date) set.add(d.toISOString());
+    return set;
+  }
+
+  if (typeof ex === 'object') {
+    for (const d of Object.values(ex)) {
+      if (d instanceof Date) set.add(d.toISOString());
+    }
+  }
+
+  return set;
+}
+
+function expandOccurrences(ev, windowStart, windowEnd) {
+  // Returns Date[] of actual class occurrences in [windowStart, windowEnd]
+  // Applies EXDATE; unions in RDATE if present.
+  if (!(ev.start instanceof Date)) return [];
+
+  let occ = [];
+
+  // If there's an RRULE, use it; else treat as single event.
+  if (ev.rrule && typeof ev.rrule.between === 'function') {
+    occ = ev.rrule.between(windowStart, windowEnd, true);
+  } else {
+    occ = [ev.start];
+  }
+
+  const exSet = collectExdateSet(ev);
+  occ = occ.filter(d => (d instanceof Date) && !exSet.has(d.toISOString()));
+
+  // Optional: include RDATE (rare but safe)
+  const r = ev.rdate || ev.rdates;
+  if (r) {
+    const vals = Array.isArray(r) ? r : (typeof r === 'object' ? Object.values(r) : []);
+    for (const d of vals) {
+      if (d instanceof Date) occ.push(d);
+    }
+  }
+
+  // De-dupe + sort
+  const uniq = [...new Map(occ.map(d => [d.toISOString(), d])).values()];
+  uniq.sort((a, b) => a - b);
+  return uniq;
+}
+
+function parseNusmodsIcsToTimetableEntries(icsText) {
+  const parsed = ical.parseICS(icsText);
+
+  // Collect all weekly VEVENTs first
+  const weeklyEvents = [];
+  for (const k of Object.keys(parsed)) {
+    const ev = parsed[k];
+    if (!ev || ev.type !== 'VEVENT') continue;
+
+    const rruleStr = ev.rrule?.toString?.() || '';
+    const isWeekly = /FREQ=WEEKLY/i.test(rruleStr) || (ev.rrule && ev.rrule.options?.freq === 2);
+    if (!isWeekly) continue;
+
+    if (!(ev.start instanceof Date) || !(ev.end instanceof Date)) continue;
+    weeklyEvents.push(ev);
+  }
+
+  // Compute semesterStart = Monday of earliest DTSTART among weekly events
+  let semesterStart = null;
+  if (weeklyEvents.length > 0) {
+    const earliest = new Date(Math.min(...weeklyEvents.map(ev => ev.start.getTime())));
+    semesterStart = mondayOfWeek(earliest);
+  }
+
+  // Define a safe semester window for expansion (e.g., ~18 weeks)
+  // Using semesterStart makes week numbers consistent.
+  let windowStart = null;
+  let windowEnd = null;
+  if (semesterStart) {
+    windowStart = new Date(semesterStart);
+    windowEnd = new Date(semesterStart);
+    windowEnd.setDate(windowEnd.getDate() + 7 * 20); // 20 weeks window
+  } else {
+    // Fallback if semesterStart couldn't be computed
+    windowStart = new Date();
+    windowStart.setDate(windowStart.getDate() - 14);
+    windowEnd = new Date();
+    windowEnd.setDate(windowEnd.getDate() + 7 * 20);
+  }
+
+  // Build entries
+  const entries = [];
+
+  for (const ev of weeklyEvents) {
+    const day_of_week = ev.start.getDay(); // 0 Sun ... 6 Sat
+    const start_time = timeFromDateLocal(ev.start);
+    const end_time = timeFromDateLocal(ev.end);
+
+    const subject = makeSubjectModulePlusType(ev.summary);
+    const location = ev.location ? String(ev.location).trim() : null;
+
+    if (!subject || !start_time || !end_time) continue;
+
+    // Expand occurrences across semester window (THIS is the critical fix)
+    const occ = expandOccurrences(ev, windowStart, windowEnd);
+
+    // Compute weeks from occurrences
+    let weeks = [];
+    if (semesterStart && occ.length > 0) {
+      const semStartStr = isoDate(semesterStart);
+      weeks = [...new Set(occ.map(d => weekNumber(d, semStartStr)))]
+        .filter(w => w != null && w >= 1 && w <= 30)
+        .sort((a, b) => a - b);
+    }
+
+    // Decide weekly vs irregular:
+    // - If it hits "most weeks", treat as weekly (weeks_json = null)
+    // - If it only appears in a subset, store weeks_json.
+    //
+    // (You can tune thresholds; these are conservative.)
+    let weeks_json = null;
+    if (weeks.length > 0) {
+      // If it's missing many weeks (e.g., only a handful), mark irregular.
+      // Typical semester weekly count ~12-13; allow a bit of variation.
+      if (weeks.length <= 10) {
+        weeks_json = JSON.stringify(weeks);
+      } else {
+        // likely weekly: keep null
+        weeks_json = null;
+      }
+    } else {
+      // If we couldn't compute, assume weekly (null) to avoid "Weeks 1" artifacts
+      weeks_json = null;
+    }
+
+    entries.push({ subject, day_of_week, start_time, end_time, location, weeks_json });
+  }
+
+  // De-dupe
+  const seen = new Set();
+  const deduped = [];
+  for (const e of entries) {
+    const key = `${e.subject}|${e.day_of_week}|${e.start_time}|${e.end_time}|${e.location || ''}|${e.weeks_json || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(e);
+  }
+
+  // Sort for preview
+  deduped.sort((a, b) => (a.day_of_week - b.day_of_week) || a.start_time.localeCompare(b.start_time) || a.subject.localeCompare(b.subject));
+
+  return { entries: deduped, semesterStart: semesterStart ? isoDate(semesterStart) : null };
+}
+
 function buildMainMenuKeyboard() {
   return {
     inline_keyboard: [
@@ -643,6 +907,9 @@ function buildMainMenuKeyboard() {
       [
         { text: '📚 Timetable', callback_data: 'menu:timetable' },
         { text: '➕ Add Class', callback_data: 'menu:addclass' }
+      ],
+      [
+        { text: '📥 Import Timetable (.ics)', callback_data: 'menu:import_timetable' }
       ],
       [
         { text: '✏️ Edit Events', callback_data: 'menu:edit' },
@@ -1116,8 +1383,11 @@ async function handleTimetable(chatId) {
     if (byDay[day]) {
       message += `*${day}:*\n`;
       for (const entry of byDay[day]) {
-        const loc = entry.location ? ` 📍 ${escapeMarkdown(entry.location)}` : '';
-        message += `  [${entry.id}] ${escapeMarkdown(entry.start_time)}-${escapeMarkdown(entry.end_time)} ${escapeMarkdown(entry.subject)}${loc}\n`;
+        const loc = entry.location ? ` @ ${escapeMarkdown(entry.location)}` : '';
+        const weeksLabel = entry.weeks_json
+          ? ` (Weeks **${JSON.parse(entry.weeks_json).join(', ')}**)`
+          : '';
+        message += `  [${entry.id}] ${escapeMarkdown(entry.start_time)}-${escapeMarkdown(entry.end_time)} ${escapeMarkdown(entry.subject)}${loc}${weeksLabel}\n`;
       }
       message += '\n';
     }
@@ -1319,6 +1589,25 @@ bot.on('callback_query', async (query) => {
       if (action === 'next') return handleNext(chatId);
       if (action === 'all') return handleAll(chatId);
       if (action === 'timetable') return handleTimetable(chatId);
+
+      if (action === 'import_timetable') {
+        const session = getSession(chatId);
+        session.importingTimetable = true;
+        session.pendingTimetableImport = null;
+        session.updatedAt = nowMs();
+
+        await bot.answerCallbackQuery(query.id);
+        return bot.sendMessage(
+          chatId,
+          `📥 *Import Timetable (.ics)*\n\n` +
+            `1) Go to NUSMods → Export → Calendar (.ics)\n` +
+            `2) Send the .ics file here as a document\n\n` +
+            `I will extract weekly classes and store them as:\n` +
+            `ModuleCode + ClassType (e.g., "CS2113 Tutorial").\n\n` +
+            `Type /cancel to exit.`,
+          { parse_mode: 'Markdown' }
+        );
+      }
 
       if (action === 'addclass') {
         const session = getSession(chatId);
@@ -1723,6 +2012,84 @@ bot.on('callback_query', async (query) => {
       return;
     }
 
+    // TIMETABLE IMPORT HANDLERS
+    if (data.startsWith('timetable_import:')) {
+      const mode = data.split(':')[1]; // replace | merge | cancel
+      await bot.answerCallbackQuery(query.id);
+
+      if (mode === 'cancel') {
+        session.importingTimetable = false;
+        session.pendingTimetableImport = null;
+        return bot.sendMessage(chatId, '❌ Timetable import cancelled.');
+      }
+
+      const pending = session.pendingTimetableImport;
+      if (!pending || !Array.isArray(pending.entries) || pending.entries.length === 0) {
+        session.importingTimetable = false;
+        session.pendingTimetableImport = null;
+        return bot.sendMessage(chatId, '❌ No pending import found (it may have expired). Please re-send the .ics file.');
+      }
+
+      const toInsert = pending.entries;
+
+      if (mode === 'replace') {
+        await clearSchoolTimetable(chatId);
+        for (const e of toInsert) await addSchoolTimetableEntry(chatId, e);
+
+        // Store semester start date if available
+        if (pending.semesterStart) {
+          await db.run(
+            `INSERT INTO settings (chat_id, semester_start_date) 
+             VALUES (?, ?) 
+             ON CONFLICT(chat_id) DO UPDATE SET semester_start_date = ?`,
+            chatId,
+            pending.semesterStart,
+            pending.semesterStart
+          );
+        }
+
+        session.importingTimetable = false;
+        session.pendingTimetableImport = null;
+
+        await bot.sendMessage(chatId, `✅ Imported *${toInsert.length}* weekly class entries (replaced existing timetable).`, { parse_mode: 'Markdown' });
+        return handleTimetable(chatId);
+      }
+
+      if (mode === 'merge') {
+        const existing = await getSchoolTimetable(chatId);
+        const existSet = new Set(
+          existing.map(e => `${e.subject}|${e.day_of_week}|${e.start_time}|${e.end_time}|${e.location || ''}|${e.weeks_json || ''}`)
+        );
+
+        let added = 0;
+        for (const e of toInsert) {
+          const key = `${e.subject}|${e.day_of_week}|${e.start_time}|${e.end_time}|${e.location || ''}|${e.weeks_json || ''}`;
+          if (existSet.has(key)) continue;
+          await addSchoolTimetableEntry(chatId, e);
+          existSet.add(key);
+          added++;
+        }
+
+        // Store semester start date if available
+        if (pending.semesterStart) {
+          await db.run(
+            `INSERT INTO settings (chat_id, semester_start_date) 
+             VALUES (?, ?) 
+             ON CONFLICT(chat_id) DO UPDATE SET semester_start_date = ?`,
+            chatId,
+            pending.semesterStart,
+            pending.semesterStart
+          );
+        }
+
+        session.importingTimetable = false;
+        session.pendingTimetableImport = null;
+
+        await bot.sendMessage(chatId, `✅ Imported *${added}* new weekly class entries (merged).`, { parse_mode: 'Markdown' });
+        return handleTimetable(chatId);
+      }
+    }
+
     await bot.answerCallbackQuery(query.id);
   } catch (err) {
     console.error('callback_query error:', err);
@@ -1739,10 +2106,82 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text?.trim();
 
-  if (!text) return;
-
   const session = getSession(chatId);
   session.updatedAt = nowMs();
+
+  // Handle timetable import via .ics document (check before text check)
+  if (session.importingTimetable && msg.document) {
+    const doc = msg.document;
+    const filename = (doc.file_name || '').toLowerCase();
+
+    if (!filename.endsWith('.ics')) {
+      return bot.sendMessage(chatId, '❌ Please send a .ics file (NUSMods calendar export).');
+    }
+
+    const processingMsg = await bot.sendMessage(chatId, '🤔 Downloading & parsing .ics...');
+
+    try {
+      const fileLink = await bot.getFileLink(doc.file_id);
+      const res = await fetch(fileLink);
+      if (!res.ok) throw new Error(`Failed to fetch file: ${res.status}`);
+      const icsText = await res.text();
+
+      const result = parseNusmodsIcsToTimetableEntries(icsText);
+      const entries = result.entries || [];
+      const semesterStart = result.semesterStart;
+
+      try { await bot.deleteMessage(chatId, processingMsg.message_id); } catch {}
+
+      if (!entries || entries.length === 0) {
+        session.importingTimetable = false;
+        session.pendingTimetableImport = null;
+        return bot.sendMessage(chatId, '❌ I could not find any weekly classes in that .ics file.');
+      }
+
+      // Store semester start date if computed
+      if (semesterStart) {
+        await db.run(
+          `INSERT INTO settings (chat_id, semester_start_date) 
+           VALUES (?, ?) 
+           ON CONFLICT(chat_id) DO UPDATE SET semester_start_date = ?`,
+          chatId,
+          semesterStart,
+          semesterStart
+        );
+      }
+
+      session.pendingTimetableImport = { entries, filename: doc.file_name, semesterStart, createdAt: nowMs() };
+      session.updatedAt = nowMs();
+
+      // Build a small preview (first ~10)
+      const previewLines = entries.slice(0, 10).map(e => {
+        const day = getDayName(e.day_of_week);
+        const loc = e.location ? ` @ ${escapeMarkdown(e.location)}` : '';
+        const weeksLabel = e.weeks_json
+          ? ` (Weeks **${JSON.parse(e.weeks_json).join(', ')}**)`
+          : '';
+        return `• ${escapeMarkdown(e.subject)} — ${day} ${e.start_time}-${e.end_time}${loc}${weeksLabel}`;
+      });
+
+      const more = entries.length > 10 ? `\n…and ${entries.length - 10} more.` : '';
+
+      return bot.sendMessage(
+        chatId,
+        `📥 Parsed *${entries.length}* weekly class entries from *${escapeMarkdown(doc.file_name)}*.\n\n` +
+          `${previewLines.join('\n')}${more}\n\n` +
+          `What do you want to do?`,
+        { parse_mode: 'Markdown', reply_markup: buildTimetableImportKeyboard() }
+      );
+    } catch (err) {
+      console.error('ICS import error:', err);
+      try { await bot.deleteMessage(chatId, processingMsg.message_id); } catch {}
+      session.importingTimetable = false;
+      session.pendingTimetableImport = null;
+      return bot.sendMessage(chatId, '❌ Failed to import timetable. Try exporting again from NUSMods and re-uploading.');
+    }
+  }
+
+  if (!text) return;
 
   // Ignore commands here; command handlers already exist
   if (text.startsWith('/')) {
@@ -1750,6 +2189,13 @@ bot.on('message', async (msg) => {
     if (text === '/cancel' && session.addingClass) {
       session.addingClass = false;
       await bot.sendMessage(chatId, '❌ Cancelled adding class.');
+      return;
+    }
+    // Handle /cancel to exit import mode
+    if (text === '/cancel' && session.importingTimetable) {
+      session.importingTimetable = false;
+      session.pendingTimetableImport = null;
+      await bot.sendMessage(chatId, '❌ Cancelled timetable import.');
       return;
     }
     return;
