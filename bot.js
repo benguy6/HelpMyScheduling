@@ -1,15 +1,5 @@
 /**
  * AI Schedule Bot - cleaned and fixed version
- *
- * Key fixes applied:
- * 1) Removed the duplicated / stray callback-handler block that referenced undefined vars.
- * 2) Removed duplicate buildConflictKeyboard definition (kept single source).
- * 3) Replaced fragile callback routing via bot.processUpdate with direct handler functions.
- * 4) Merged the two bot.on('message') handlers into ONE, with edit-field interception first.
- *
- * Notes:
- * - Ensure you have TELEGRAM_TOKEN and OPENAI_API_KEY in .env in the same folder.
- * - This code keeps your draft-confirm flow, conflict handling, edit/delete flows, reminders, and daily summary.
  */
 
 const path = require('path');
@@ -85,8 +75,20 @@ async function initDatabase() {
       timezone TEXT DEFAULT 'UTC'
     );
 
+    CREATE TABLE IF NOT EXISTS school_timetable (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      day_of_week INTEGER NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      location TEXT,
+      created_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_events_chat_date ON events(chat_id, date);
     CREATE INDEX IF NOT EXISTS idx_events_datetime ON events(date, start_time);
+    CREATE INDEX IF NOT EXISTS idx_school_timetable_chat_day ON school_timetable(chat_id, day_of_week);
   `);
 
   console.log('✅ Database initialized');
@@ -98,7 +100,7 @@ async function initDatabase() {
 const DRAFT_TTL_MS = 90 * 1000; // 90 seconds
 const CONFIRM_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-// chatId -> { drafts: [ {id, draft, state, updatedAt, overwriteNext} ], updatedAt, editingEventId, editingField }
+// chatId -> { drafts: [ {id, draft, state, updatedAt, overwriteNext} ], updatedAt, editingEventId, editingField, addingClass }
 const sessions = new Map();
 
 // Scheduled reminder jobs
@@ -110,7 +112,7 @@ function nowMs() {
 
 function getSession(chatId) {
   if (!sessions.has(chatId)) {
-    sessions.set(chatId, { drafts: [], updatedAt: nowMs(), editingEventId: null, editingField: null });
+    sessions.set(chatId, { drafts: [], updatedAt: nowMs(), editingEventId: null, editingField: null, addingClass: false });
   }
   return sessions.get(chatId);
 }
@@ -152,12 +154,37 @@ function formatDate(dateStr) {
 
 function normalizeTime(t) {
   if (!t) return null;
-  const m = String(t).trim().match(/^(\d{1,2}):(\d{2})$/);
-  if (!m) return null;
-  const hh = Number(m[1]);
-  const mm = Number(m[2]);
-  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
-  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+  let timeStr = String(t).trim();
+  
+  // Replace dots with colons (e.g., "6.30" -> "6:30")
+  timeStr = timeStr.replace(/\./g, ':');
+  
+  // Try HH:MM format first
+  let m = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+      return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+    }
+  }
+  
+  // Try parsing 12-hour format with am/pm
+  m = timeStr.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i);
+  if (m) {
+    let hh = Number(m[1]);
+    const mm = m[2] ? Number(m[2]) : 0;
+    const period = m[3].toLowerCase();
+    
+    if (period === 'pm' && hh !== 12) hh += 12;
+    if (period === 'am' && hh === 12) hh = 0;
+    
+    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+      return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+    }
+  }
+  
+  return null;
 }
 
 function escapeMarkdown(text) {
@@ -286,9 +313,86 @@ async function updateEvent(chatId, eventId, updates) {
   if (event) await scheduleReminder(chatId, event);
 }
 
+// =====================================================
+// SCHOOL TIMETABLE OPERATIONS
+// =====================================================
+async function addSchoolTimetableEntry(chatId, entry) {
+  const result = await db.run(
+    `INSERT INTO school_timetable (chat_id, subject, day_of_week, start_time, end_time, location, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    chatId,
+    entry.subject,
+    entry.day_of_week,
+    entry.start_time,
+    entry.end_time,
+    entry.location || null,
+    new Date().toISOString()
+  );
+
+  return {
+    id: result.lastID,
+    chat_id: chatId,
+    subject: entry.subject,
+    day_of_week: entry.day_of_week,
+    start_time: entry.start_time,
+    end_time: entry.end_time,
+    location: entry.location || null
+  };
+}
+
+async function getSchoolTimetable(chatId) {
+  return db.all(
+    `SELECT * FROM school_timetable 
+     WHERE chat_id = ? 
+     ORDER BY day_of_week, start_time`,
+    chatId
+  );
+}
+
+async function getSchoolTimetableForDate(chatId, dateStr) {
+  const date = new Date(dateStr);
+  const dayOfWeek = date.getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+  
+  return db.all(
+    `SELECT * FROM school_timetable 
+     WHERE chat_id = ? AND day_of_week = ? 
+     ORDER BY start_time`,
+    chatId,
+    dayOfWeek
+  );
+}
+
+async function deleteSchoolTimetableEntry(chatId, entryId) {
+  await db.run('DELETE FROM school_timetable WHERE id = ? AND chat_id = ?', entryId, chatId);
+}
+
+async function clearSchoolTimetable(chatId) {
+  await db.run('DELETE FROM school_timetable WHERE chat_id = ?', chatId);
+}
+
+function getDayName(dayOfWeek) {
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  return days[dayOfWeek];
+}
+
+function parseDayOfWeek(dayStr) {
+  const day = dayStr.toLowerCase().trim();
+  const dayMap = {
+    'sunday': 0, 'sun': 0,
+    'monday': 1, 'mon': 1,
+    'tuesday': 2, 'tue': 2, 'tues': 2,
+    'wednesday': 3, 'wed': 3,
+    'thursday': 4, 'thu': 4, 'thur': 4, 'thurs': 4,
+    'friday': 5, 'fri': 5,
+    'saturday': 6, 'sat': 6
+  };
+  return dayMap[day] !== undefined ? dayMap[day] : null;
+}
+
 async function checkConflicts(chatId, date, startTime, endTime) {
   if (!startTime) return [];
 
+  // Get regular events for the date
   const events = await db.all(
     `SELECT * FROM events 
      WHERE chat_id = ? AND date = ? AND start_time IS NOT NULL`,
@@ -296,18 +400,45 @@ async function checkConflicts(chatId, date, startTime, endTime) {
     date
   );
 
+  // Get school timetable entries for this day of week
+  const schoolEntries = await getSchoolTimetableForDate(chatId, date);
+
   const conflicts = [];
   const newStart = timeToMinutes(startTime);
   const newEnd = endTime ? timeToMinutes(endTime) : newStart + 60;
 
+  // Check against regular events
   for (const event of events) {
     const eventStart = timeToMinutes(event.start_time);
     const eventEnd = event.end_time ? timeToMinutes(event.end_time) : eventStart + 60;
 
     if (newStart < eventEnd && eventStart < newEnd) {
-      conflicts.push(event);
+      conflicts.push({
+        ...event,
+        source: 'event'
+      });
     }
   }
+
+  // Check against school timetable
+  for (const entry of schoolEntries) {
+    const entryStart = timeToMinutes(entry.start_time);
+    const entryEnd = timeToMinutes(entry.end_time);
+
+    if (newStart < entryEnd && entryStart < newEnd) {
+      conflicts.push({
+        id: entry.id,
+        task: entry.subject,
+        date: date,
+        start_time: entry.start_time,
+        end_time: entry.end_time,
+        location: entry.location,
+        type: 'class',
+        source: 'school_timetable'
+      });
+    }
+  }
+
   return conflicts;
 }
 
@@ -510,6 +641,10 @@ function buildMainMenuKeyboard() {
         { text: '📋 All', callback_data: 'menu:all' }
       ],
       [
+        { text: '📚 Timetable', callback_data: 'menu:timetable' },
+        { text: '➕ Add Class', callback_data: 'menu:addclass' }
+      ],
+      [
         { text: '✏️ Edit Events', callback_data: 'menu:edit' },
         { text: '🗑️ Delete Events', callback_data: 'menu:delete' }
       ],
@@ -636,6 +771,142 @@ async function parseScheduleMessage(message) {
 }
 
 // =====================================================
+// AI PARSER FOR CLASS/TIMETABLE ENTRIES
+// =====================================================
+async function parseClassMessage(message) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0,
+      max_tokens: 800,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You extract class/timetable information from chat messages.\n' +
+            'Return ONLY valid JSON.\n\n' +
+            'Extract information about recurring classes that happen weekly.\n' +
+            'The message may contain ONE or MULTIPLE classes.\n\n' +
+            'Output JSON shape:\n' +
+            '{ "success": true, "classes": [{ "subject": string, "day_of_week": string, "start_time": "HH:MM", "end_time": "HH:MM", "location": string|null }, ...] }\n\n' +
+            'OR if unable to parse:\n' +
+            '{ "success": false, "error": "missing_info" }\n\n' +
+            'IMPORTANT RULES:\n' +
+            '- "day_of_week" must be one of: "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"\n' +
+            '- If a class has MULTIPLE days (e.g., "Every Tuesday and Thursday"), create SEPARATE entries for EACH day\n' +
+            '- Handle "Every [Day]" format - extract just the day name (e.g., "Every Monday" -> "Monday")\n' +
+            '- Convert times to 24-hour format (HH:MM). Examples:\n' +
+            '  * "9am" -> "09:00"\n' +
+            '  * "12pm" -> "12:00"\n' +
+            '  * "2:30pm" -> "14:30"\n' +
+            '  * "6.30pm" -> "18:30" (handle dots as colons)\n' +
+            '  * "6:30pm" -> "18:30"\n' +
+            '- If time range is given (e.g., "12pm-3pm", "6.30pm-9.30pm"), extract start_time and end_time\n' +
+            '- If only one time is given, assume class is 1 hour long\n' +
+            '- "subject" is the class name/course code (e.g., "NM3230", "CS2113LECTURE", "Math 101")\n' +
+            '- "location" is optional - extract if mentioned (e.g., "AS6-0214", "Room 101", "Lab 3")\n' +
+            '- If day is mentioned as abbreviation (Mon, Tue, Wed, etc.), convert to full day name\n' +
+            '- SKIP classes with specific dates (e.g., "10th Feb, 10th March") - only extract weekly recurring classes\n' +
+            '- If the message contains multiple classes (separated by newlines), extract ALL of them\n' +
+            '- If information is incomplete for a class, skip that class but continue parsing others\n' +
+            '- Return success: false only if NO classes could be parsed\n\n' +
+            'Examples:\n' +
+            '- "NM3230 Every Monday 12pm-3pm AS6-0214" -> { "success": true, "classes": [{ "subject": "NM3230", "day_of_week": "Monday", "start_time": "12:00", "end_time": "15:00", "location": "AS6-0214" }] }\n' +
+            '- "MNO2711 Every Monday 6.30pm-9.30pm BIZ2" -> { "success": true, "classes": [{ "subject": "MNO2711", "day_of_week": "Monday", "start_time": "18:30", "end_time": "21:30", "location": "BIZ2" }] }\n' +
+            '- "CG2023LECTURE Every Tuesday and Thursday 4pm-6pm" -> { "success": true, "classes": [{ "subject": "CG2023LECTURE", "day_of_week": "Tuesday", "start_time": "16:00", "end_time": "18:00", "location": null }, { "subject": "CG2023LECTURE", "day_of_week": "Thursday", "start_time": "16:00", "end_time": "18:00", "location": null }] }\n' +
+            '- "CS2113LECTURE Every Friday 4pm-6pm" -> { "success": true, "classes": [{ "subject": "CS2113LECTURE", "day_of_week": "Friday", "start_time": "16:00", "end_time": "18:00", "location": null }] }\n'
+        },
+        {
+          role: 'user',
+          content: `Message:\n"""${message}"""\n\nReturn ONLY JSON.`
+        }
+      ]
+    });
+
+    const text = response.choices?.[0]?.message?.content?.trim();
+    if (!text) return { success: false, error: 'Empty model response' };
+
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object') return { success: false, error: 'Invalid JSON object' };
+
+    if (parsed.success === true && Array.isArray(parsed.classes)) {
+      const validClasses = [];
+
+      for (const cls of parsed.classes) {
+        // Handle multiple days - if day_of_week contains "and" or comma, split it
+        let days = [];
+        if (cls.day_of_week && (cls.day_of_week.includes(' and ') || cls.day_of_week.includes(','))) {
+          // Split by "and" or comma
+          const dayParts = cls.day_of_week.split(/ and |,/).map(d => d.trim());
+          days = dayParts.filter(d => d);
+        } else {
+          days = [cls.day_of_week];
+        }
+
+        // Process each day
+        for (let dayStr of days) {
+          // Remove "Every" prefix if present
+          dayStr = String(dayStr || '').trim().replace(/^every\s+/i, '').trim();
+          
+          const dayOfWeek = parseDayOfWeek(dayStr);
+          if (dayOfWeek === null) {
+            console.warn(`Invalid day of week: ${dayStr} for class: ${cls.subject}`);
+            continue;
+          }
+
+          // Normalize time - handle dots in time format
+          let startTimeStr = String(cls.start_time || '').trim();
+          let endTimeStr = String(cls.end_time || '').trim();
+          
+          // Replace dots with colons in time strings (e.g., "6.30" -> "6:30")
+          startTimeStr = startTimeStr.replace(/\./g, ':');
+          endTimeStr = endTimeStr.replace(/\./g, ':');
+
+          const startTime = normalizeTime(startTimeStr);
+          const endTime = normalizeTime(endTimeStr);
+
+          if (!startTime || !endTime) {
+            console.warn(`Invalid time format for class: ${cls.subject} (start: ${startTimeStr}, end: ${endTimeStr})`);
+            continue;
+          }
+
+          const subject = String(cls.subject || '').trim();
+          if (!subject) {
+            console.warn('Missing subject for class');
+            continue;
+          }
+
+          validClasses.push({
+            subject,
+            day_of_week: dayOfWeek,
+            start_time: startTime,
+            end_time: endTime,
+            location: cls.location ? String(cls.location).trim() : null
+          });
+        }
+      }
+
+      if (validClasses.length === 0) {
+        return { success: false, error: 'No valid classes could be parsed' };
+      }
+
+      return {
+        success: true,
+        classes: validClasses
+      };
+    }
+
+    return { success: false, error: parsed.error || 'Failed to parse class information' };
+  } catch (error) {
+    console.error('AI class parsing error:', error);
+    if (error?.status === 401) return { success: false, error: 'invalid_api_key' };
+    if (error?.status === 429) return { success: false, error: 'quota' };
+    return { success: false, error: 'Failed to parse class information' };
+  }
+}
+
+// =====================================================
 // DAILY SUMMARY
 // =====================================================
 async function sendDailySummary() {
@@ -668,15 +939,74 @@ schedule.scheduleJob('0 21 * * *', sendDailySummary);
 // =====================================================
 // COMMAND HANDLERS (reused by menu callbacks)
 // =====================================================
+async function getEventsWithSchoolTimetable(chatId, startDate, endDate) {
+  const events = await getEventsInRange(chatId, startDate, endDate);
+  const allItems = [...events];
+
+  // Add school timetable entries for each date in range
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const dateStr = isoDate(d);
+    const schoolEntries = await getSchoolTimetableForDate(chatId, dateStr);
+    
+    for (const entry of schoolEntries) {
+      allItems.push({
+        id: `school_${entry.id}`,
+        chat_id: chatId,
+        task: entry.subject,
+        date: dateStr,
+        start_time: entry.start_time,
+        end_time: entry.end_time,
+        location: entry.location,
+        type: 'class',
+        source: 'school_timetable'
+      });
+    }
+  }
+
+  // Sort by date and time
+  allItems.sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    const aTime = a.start_time || '23:59';
+    const bTime = b.start_time || '23:59';
+    return aTime.localeCompare(bTime);
+  });
+
+  return allItems;
+}
+
 async function handleToday(chatId) {
   const today = isoDate(new Date());
-  const tasks = await getEventsInRange(chatId, today, today);
+  const tasks = await getEventsWithSchoolTimetable(chatId, today, today);
 
-  const message = tasks.length > 0
-    ? `📅 *Today's Schedule*\n${formatTaskList(tasks)}`
-    : `📅 *Today's Schedule*\n\nNo tasks for today!`;
+  if (tasks.length === 0) {
+    return bot.sendMessage(chatId, `📅 *Today's Schedule*\n\nNo tasks or classes for today!`, { parse_mode: 'Markdown' });
+  }
 
-  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+  let message = `📅 *Today's Schedule*\n`;
+  let currentDate = null;
+
+  for (const task of tasks) {
+    if (task.date !== currentDate) {
+      currentDate = task.date;
+      message += `\n📅 *${escapeMarkdown(formatDate(task.date))}*\n`;
+    }
+
+    const icon = task.source === 'school_timetable' ? '📚' : getEventIcon(task.type);
+    let timeLabel = null;
+    if (task.start_time && task.end_time) timeLabel = `${task.start_time}-${task.end_time}`;
+    else if (task.start_time) timeLabel = task.start_time;
+
+    const timeStr = timeLabel ? `⏰ ${escapeMarkdown(timeLabel)} - ` : '• ';
+    const locStr = task.location ? ` 📍 ${escapeMarkdown(task.location)}` : '';
+    const sourceStr = task.source === 'school_timetable' ? ' (School)' : '';
+    message += `${icon} ${timeStr}${escapeMarkdown(task.task)}${locStr}${sourceStr}\n`;
+  }
+
+  return bot.sendMessage(chatId, message.trim(), { parse_mode: 'Markdown' });
 }
 
 async function handleWeek(chatId) {
@@ -684,13 +1014,33 @@ async function handleWeek(chatId) {
   const end = new Date(start);
   end.setDate(end.getDate() + 6);
 
-  const tasks = await getEventsInRange(chatId, isoDate(start), isoDate(end));
+  const tasks = await getEventsWithSchoolTimetable(chatId, isoDate(start), isoDate(end));
 
-  const message = tasks.length > 0
-    ? `📆 *Next 7 Days*\n${formatTaskList(tasks)}`
-    : `📆 *Next 7 Days*\n\nNo tasks this week!`;
+  if (tasks.length === 0) {
+    return bot.sendMessage(chatId, `📆 *Next 7 Days*\n\nNo tasks or classes this week!`, { parse_mode: 'Markdown' });
+  }
 
-  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+  let message = `📆 *Next 7 Days*\n`;
+  let currentDate = null;
+
+  for (const task of tasks) {
+    if (task.date !== currentDate) {
+      currentDate = task.date;
+      message += `\n📅 *${escapeMarkdown(formatDate(task.date))}*\n`;
+    }
+
+    const icon = task.source === 'school_timetable' ? '📚' : getEventIcon(task.type);
+    let timeLabel = null;
+    if (task.start_time && task.end_time) timeLabel = `${task.start_time}-${task.end_time}`;
+    else if (task.start_time) timeLabel = task.start_time;
+
+    const timeStr = timeLabel ? `⏰ ${escapeMarkdown(timeLabel)} - ` : '• ';
+    const locStr = task.location ? ` 📍 ${escapeMarkdown(task.location)}` : '';
+    const sourceStr = task.source === 'school_timetable' ? ' (School)' : '';
+    message += `${icon} ${timeStr}${escapeMarkdown(task.task)}${locStr}${sourceStr}\n`;
+  }
+
+  return bot.sendMessage(chatId, message.trim(), { parse_mode: 'Markdown' });
 }
 
 async function handleAll(chatId) {
@@ -735,6 +1085,45 @@ async function handleNext(chatId) {
     `📅 ${escapeMarkdown(dateLabel)}` +
     (timeLabel ? ` ⏰ ${escapeMarkdown(timeLabel)}` : '') +
     locStr;
+
+  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+}
+
+async function handleTimetable(chatId) {
+  const entries = await getSchoolTimetable(chatId);
+
+  if (entries.length === 0) {
+    return bot.sendMessage(
+      chatId,
+      `📚 *School Timetable*\n\nNo timetable entries yet.\n\n` +
+      `Use /addclass to add a class (e.g., "/addclass Math Monday 09:00 10:00 Room 101")`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  // Group by day
+  const byDay = {};
+  for (const entry of entries) {
+    const dayName = getDayName(entry.day_of_week);
+    if (!byDay[dayName]) byDay[dayName] = [];
+    byDay[dayName].push(entry);
+  }
+
+  let message = `📚 *School Timetable*\n\n`;
+  const dayOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+  
+  for (const day of dayOrder) {
+    if (byDay[day]) {
+      message += `*${day}:*\n`;
+      for (const entry of byDay[day]) {
+        const loc = entry.location ? ` 📍 ${escapeMarkdown(entry.location)}` : '';
+        message += `  [${entry.id}] ${escapeMarkdown(entry.start_time)}-${escapeMarkdown(entry.end_time)} ${escapeMarkdown(entry.subject)}${loc}\n`;
+      }
+      message += '\n';
+    }
+  }
+
+  message += `\nUse /deleteclass <id> to remove a class (e.g., /deleteclass 1)`;
 
   return bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
 }
@@ -806,6 +1195,85 @@ bot.onText(/\/reminder (\d+)/, async (msg, match) => {
   bot.sendMessage(chatId, `✅ Default reminder set to ${minutes} minutes before events.`);
 });
 
+bot.onText(/\/timetable/, async (msg) => {
+  await handleTimetable(msg.chat.id);
+});
+
+bot.onText(/\/addclass (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const args = match[1].trim().split(/\s+/);
+  
+  if (args.length < 4) {
+    return bot.sendMessage(
+      chatId,
+      `❌ Usage: /addclass <subject> <day> <start_time> <end_time> [location]\n\n` +
+      `Example: /addclass Math Monday 09:00 10:00 Room 101\n` +
+      `Example: /addclass Physics Tuesday 14:00 15:30`
+    );
+  }
+
+  const subject = args[0];
+  const dayStr = args[1];
+  const startTime = normalizeTime(args[2]);
+  const endTime = normalizeTime(args[3]);
+  const location = args.slice(4).join(' ') || null;
+
+  if (!startTime || !endTime) {
+    return bot.sendMessage(chatId, '❌ Invalid time format. Use HH:MM (e.g., 09:00, 14:30)');
+  }
+
+  const dayOfWeek = parseDayOfWeek(dayStr);
+  if (dayOfWeek === null) {
+    return bot.sendMessage(chatId, `❌ Invalid day. Use: Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, or Sunday`);
+  }
+
+  try {
+    const entry = await addSchoolTimetableEntry(chatId, {
+      subject,
+      day_of_week: dayOfWeek,
+      start_time: startTime,
+      end_time: endTime,
+      location
+    });
+
+    const locStr = location ? ` 📍 ${escapeMarkdown(location)}` : '';
+    await bot.sendMessage(
+      chatId,
+      `✅ Added to timetable:\n\n` +
+      `📚 ${escapeMarkdown(subject)}\n` +
+      `📅 ${getDayName(dayOfWeek)}\n` +
+      `⏰ ${escapeMarkdown(startTime)}-${escapeMarkdown(endTime)}${locStr}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    console.error('Error adding class:', error);
+    await bot.sendMessage(chatId, '❌ Error adding class. Please try again.');
+  }
+});
+
+bot.onText(/\/deleteclass (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const entryId = parseInt(match[1], 10);
+
+  const entry = await db.get('SELECT * FROM school_timetable WHERE id = ? AND chat_id = ?', entryId, chatId);
+  if (!entry) {
+    return bot.sendMessage(chatId, '❌ Class not found. Use /timetable to see all classes.');
+  }
+
+  await deleteSchoolTimetableEntry(chatId, entryId);
+  await bot.sendMessage(
+    chatId,
+    `✅ Deleted: ${escapeMarkdown(entry.subject)} (${getDayName(entry.day_of_week)})`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/cleartimetable/, async (msg) => {
+  const chatId = msg.chat.id;
+  await clearSchoolTimetable(chatId);
+  await bot.sendMessage(chatId, '🗑️ School timetable cleared!');
+});
+
 bot.onText(/^\//, async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text.trim();
@@ -819,6 +1287,10 @@ bot.onText(/^\//, async (msg) => {
         `/next - View next upcoming event\n` +
         `/all - View all upcoming events\n` +
         `/reminder <minutes> - Set reminder time\n` +
+        `/timetable - View school timetable\n` +
+        `/addclass - Add a class to timetable\n` +
+        `/deleteclass <id> - Delete a class from timetable\n` +
+        `/cleartimetable - Clear all timetable entries\n` +
         `/menu - Show main menu\n` +
         `/clear - Delete all events\n`,
       { parse_mode: 'Markdown' }
@@ -846,6 +1318,34 @@ bot.on('callback_query', async (query) => {
       if (action === 'week') return handleWeek(chatId);
       if (action === 'next') return handleNext(chatId);
       if (action === 'all') return handleAll(chatId);
+      if (action === 'timetable') return handleTimetable(chatId);
+
+      if (action === 'addclass') {
+        const session = getSession(chatId);
+        session.addingClass = true;
+        session.updatedAt = nowMs();
+        await bot.answerCallbackQuery(query.id);
+        return bot.sendMessage(
+          chatId,
+          `➕ *Add Class to Timetable*\n\n` +
+          `Just describe your class(es) in natural language! I'll extract the information.\n` +
+          `You can add multiple classes in one message!\n\n` +
+          `*Examples (single class):*\n` +
+          `• "Math class on Monday from 9am to 10am in Room 101"\n` +
+          `• "Physics Tuesday 2pm-3:30pm"\n` +
+          `• "Chemistry Wed 11am"\n\n` +
+          `*Examples (multiple classes):*\n` +
+          `• "Math Monday 9am, Physics Tuesday 2pm, Chemistry Wednesday 11am"\n` +
+          `• "Math Monday 9am-10am Room 101\nPhysics Tuesday 2pm-3:30pm\nChemistry Wed 11am Lab 3"\n\n` +
+          `Make sure to include for each class:\n` +
+          `• Class/subject name\n` +
+          `• Day of the week\n` +
+          `• Start and end times\n` +
+          `• Location (optional)\n\n` +
+          `Type /cancel to cancel.`,
+          { parse_mode: 'Markdown' }
+        );
+      }
 
       if (action === 'edit') {
         const events = await getAllUpcomingEvents(chatId);
@@ -926,7 +1426,8 @@ bot.on('callback_query', async (query) => {
         const conflictList = conflicts
           .map(c => {
             const time = c.end_time ? `${c.start_time}-${c.end_time}` : c.start_time;
-            return `• ${escapeMarkdown(c.task)} (${escapeMarkdown(time)})`;
+            const source = c.source === 'school_timetable' ? '📚 (School)' : '';
+            return `• ${escapeMarkdown(c.task)} (${escapeMarkdown(time)}) ${source}`;
           })
           .join('\n');
 
@@ -1244,9 +1745,98 @@ bot.on('message', async (msg) => {
   session.updatedAt = nowMs();
 
   // Ignore commands here; command handlers already exist
-  if (text.startsWith('/')) return;
+  if (text.startsWith('/')) {
+    // Handle /cancel to exit adding class mode
+    if (text === '/cancel' && session.addingClass) {
+      session.addingClass = false;
+      await bot.sendMessage(chatId, '❌ Cancelled adding class.');
+      return;
+    }
+    return;
+  }
 
-  // 1) If user is editing an existing event, intercept first
+  // 1) If user is adding a class, intercept first
+  if (session.addingClass) {
+    const processingMsg = await bot.sendMessage(chatId, '🤔 Processing...');
+
+    const parsed = await parseClassMessage(text);
+
+    try { await bot.deleteMessage(chatId, processingMsg.message_id); } catch {}
+
+    if (!parsed.success) {
+      if (parsed.error === 'invalid_api_key') {
+        session.addingClass = false;
+        return bot.sendMessage(chatId, '❌ OpenAI API key is invalid (401). Replace it with a correct key.');
+      }
+      if (parsed.error === 'quota') {
+        session.addingClass = false;
+        return bot.sendMessage(chatId, '❌ OpenAI quota/rate limit (429). Check billing/limits on the API account.');
+      }
+      return bot.sendMessage(
+        chatId,
+        `❌ I couldn't extract all the required information from your message.\n\n` +
+        `Please include:\n` +
+        `• Class/subject name\n` +
+        `• Day of the week (e.g., Monday, Tuesday)\n` +
+        `• Start time (e.g., 9am, 14:00)\n` +
+        `• End time (e.g., 10am, 15:30)\n` +
+        `• Location (optional)\n\n` +
+        `*Examples:*\n` +
+        `• "Math class on Monday from 9am to 10am in Room 101"\n` +
+        `• "Physics Tuesday 2pm-3:30pm"\n` +
+        `• "Chemistry Wed 11am"\n\n` +
+        `Type /cancel to cancel.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    try {
+      const classes = parsed.classes || [];
+      const added = [];
+
+      for (const cls of classes) {
+        const entry = await addSchoolTimetableEntry(chatId, {
+          subject: cls.subject,
+          day_of_week: cls.day_of_week,
+          start_time: cls.start_time,
+          end_time: cls.end_time,
+          location: cls.location
+        });
+        added.push(entry);
+      }
+
+      session.addingClass = false;
+
+      if (added.length === 0) {
+        return bot.sendMessage(chatId, '❌ No classes were added. Please check your input and try again.');
+      }
+
+      let message = `✅ Added *${added.length}* class${added.length > 1 ? 'es' : ''} to timetable:\n\n`;
+      
+      for (const entry of added) {
+        const locStr = entry.location ? ` 📍 ${escapeMarkdown(entry.location)}` : '';
+        message += `📚 ${escapeMarkdown(entry.subject)}\n`;
+        message += `📅 ${getDayName(entry.day_of_week)}\n`;
+        message += `⏰ ${escapeMarkdown(entry.start_time)}-${escapeMarkdown(entry.end_time)}${locStr}\n\n`;
+      }
+
+      await bot.sendMessage(chatId, message.trim(), { parse_mode: 'Markdown' });
+      
+      // Show next-action prompt with main menu
+      await bot.sendMessage(
+        chatId,
+        '✨ What would you like to do next?',
+        { reply_markup: buildMainMenuKeyboard() }
+      );
+    } catch (error) {
+      console.error('Error adding class:', error);
+      session.addingClass = false;
+      await bot.sendMessage(chatId, '❌ Error adding class. Please try again.');
+    }
+    return;
+  }
+
+  // 2) If user is editing an existing event, intercept next
   if (session.editingEventId && session.editingField) {
     const eventId = session.editingEventId;
     const field = session.editingField;
