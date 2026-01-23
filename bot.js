@@ -216,10 +216,12 @@ function escapeMarkdown(text) {
 
 function getEventIcon(type) {
   const icons = {
+    assignment: '📝',
+    deadline: '⏰',
+    task: '✅',
     sports: '⚽',
     meeting: '💼',
     class: '📚',
-    deadline: '⏰',
     social: '🎉',
     admin: '📋',
     other: '📌'
@@ -230,6 +232,30 @@ function getEventIcon(type) {
 function timeToMinutes(time) {
   const [h, m] = time.split(':').map(Number);
   return h * 60 + m;
+}
+
+// Heuristic fallback for type classification based on raw text
+function heuristicTypeFallback(text, currentType) {
+  if (currentType) return currentType;
+  const t = String(text || '').toLowerCase();
+
+  // Graded work / assignments
+  if (/(quiz|assignment|homework|\\bhw\\b|lab|submission|submit|project|milestone|report|presentation|worksheet|problem set|write[- ]?up|exam|midterm|test)/.test(t)) {
+    return 'assignment';
+  }
+  // Deadlines (non-assessment)
+  if (/(due|deadline|by\\s+\\d|by\\s+\\d{1,2}\\s*(am|pm)|eod|23:59|2359)/.test(t)) {
+    return 'deadline';
+  }
+  // Sports / events
+  if (/(match|game|vs\\b|versus|semi final|semi-finals?|semis?|finals?|tournament|league|cup|floorball|football|soccer|basketball|badminton|tennis|run|race|marathon|ihg)/.test(t)) {
+    return 'sports';
+  }
+  // Generic tasks
+  if (/(todo|to-do|task|remember to|remind me|revision|study for|practice)/.test(t)) {
+    return 'task';
+  }
+  return currentType || null;
 }
 
 // =====================================================
@@ -604,6 +630,22 @@ function formatTaskList(tasks) {
   return message.trim();
 }
 
+// Generic renderer for grouped sections (Assignments, Tasks, Classes)
+function renderItems(items, opts = {}) {
+  let out = '';
+  for (const task of items) {
+    const icon = opts.isSchool ? '📚' : getEventIcon(task.type);
+    let timeLabel = null;
+    if (task.start_time && task.end_time) timeLabel = `${task.start_time}-${task.end_time}`;
+    else if (task.start_time) timeLabel = task.start_time;
+
+    const timeStr = timeLabel ? `⏰ ${escapeMarkdown(timeLabel)} - ` : '• ';
+    const locStr = task.location ? ` 📍 ${escapeMarkdown(task.location)}` : '';
+    out += `${icon} ${timeStr}${escapeMarkdown(task.task)}${locStr}\n`;
+  }
+  return out;
+}
+
 function makeEmptyDraft() {
   return {
     task: null,
@@ -704,6 +746,14 @@ function buildTimetableImportKeyboard() {
         { text: '➕ Merge', callback_data: 'timetable_import:merge' }
       ],
       [{ text: '❌ Cancel', callback_data: 'timetable_import:cancel' }]
+    ]
+  };
+}
+
+function buildBackToMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '⬅️ Back to Menu', callback_data: 'menu:home' }]
     ]
   };
 }
@@ -905,6 +955,10 @@ function buildMainMenuKeyboard() {
         { text: '📋 All', callback_data: 'menu:all' }
       ],
       [
+        { text: '📝 Tasks', callback_data: 'menu:tasks' },
+        { text: '🎉 Events', callback_data: 'menu:events' }
+      ],
+      [
         { text: '📚 Timetable', callback_data: 'menu:timetable' },
         { text: '➕ Add Class', callback_data: 'menu:addclass' }
       ],
@@ -950,7 +1004,7 @@ async function parseScheduleMessage(message) {
             '   "start_time": "HH:MM"|null,\n' +
             '   "end_time": "HH:MM"|null,\n' +
             '   "location": string|null,\n' +
-            '   "type": one of ["sports","meeting","class","deadline","social","admin","other"]|null\n' +
+            '   "type": one of ["assignment","deadline","task","sports","meeting","class","social","admin","other"]|null\n' +
             '} }\n\n' +
             '2) Multi-event output:\n' +
             '{ "kind":"events", "success":true, "events":[\n' +
@@ -965,7 +1019,11 @@ async function parseScheduleMessage(message) {
             '- Set overwrite_intent=true if the user is correcting (words like "change", "actually", "instead").\n' +
             '- For bulletins, apply header context (title/location) to each bullet.\n' +
             '- IMPORTANT: If the user gives a DATE RANGE (e.g., "5 to 6 Jan", "5-6 Jan"), return kind:"events" and create ONE event per date in the range.\n' +
-            '- Classify event types based on keywords: sports (gym, run, game), meeting (call, meeting), class (lecture, class), deadline (due, submit), social (party, dinner), admin (taxes, bills).\n'
+            '- Classify event types based on keywords: sports (gym, run, game), meeting (call, meeting), class (lecture, class), deadline (due, submit), social (party, dinner), admin (taxes, bills).\n' +
+            '- NEW: Prefer "assignment" for graded school deliverables (quiz, lab, homework, submission, milestone, project).\n' +
+            '- Use "deadline" for due dates that are not clearly graded deliverables.\n' +
+            '- Use "task" for general to-dos.\n' +
+            '- If both "submit" and a date/time appear, classify as "assignment" unless clearly admin.\n'
         },
         {
           role: 'user',
@@ -985,6 +1043,10 @@ async function parseScheduleMessage(message) {
 
     if (parsed.kind === 'updates' && parsed.success === true) {
       const u = parsed.updates || {};
+
+      // Apply heuristic type fallback based on the raw message text
+      const inferredType = heuristicTypeFallback(message, u.type || null);
+
       const out = {
         kind: 'updates',
         success: true,
@@ -995,7 +1057,7 @@ async function parseScheduleMessage(message) {
           start_time: normalizeTime(u.start_time),
           end_time: normalizeTime(u.end_time),
           location: u.location ? String(u.location).trim() : null,
-          type: u.type || null
+          type: inferredType
         }
       };
 
@@ -1013,7 +1075,8 @@ async function parseScheduleMessage(message) {
           start_time: normalizeTime(ev.start_time),
           end_time: normalizeTime(ev.end_time),
           location: ev.location ? String(ev.location).trim() : null,
-          type: ev.type || null
+          // Use heuristic on each event task if type is missing or null
+          type: heuristicTypeFallback(ev.task, ev.type || null)
         }))
         .filter(ev => ev.task && ev.date && /^\d{4}-\d{2}-\d{2}$/.test(ev.date));
 
@@ -1250,30 +1313,45 @@ async function handleToday(chatId) {
   const tasks = await getEventsWithSchoolTimetable(chatId, today, today);
 
   if (tasks.length === 0) {
-    return bot.sendMessage(chatId, `📅 *Today's Schedule*\n\nNo tasks or classes for today!`, { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      `📅 *Today's Schedule*\n\nNo tasks or classes for today!`,
+      { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() }
+    );
+  }
+
+  const assignments = [];
+  const otherTasks = [];
+  const classes = [];
+
+  for (const item of tasks) {
+    if (item.source === 'school_timetable') {
+      classes.push(item);
+    } else if (item.type === 'assignment' || item.type === 'deadline') {
+      assignments.push(item);
+    } else {
+      otherTasks.push(item);
+    }
   }
 
   let message = `📅 *Today's Schedule*\n`;
-  let currentDate = null;
 
-  for (const task of tasks) {
-    if (task.date !== currentDate) {
-      currentDate = task.date;
-      message += `\n📅 *${escapeMarkdown(formatDate(task.date))}*\n`;
-    }
-
-    const icon = task.source === 'school_timetable' ? '📚' : getEventIcon(task.type);
-    let timeLabel = null;
-    if (task.start_time && task.end_time) timeLabel = `${task.start_time}-${task.end_time}`;
-    else if (task.start_time) timeLabel = task.start_time;
-
-    const timeStr = timeLabel ? `⏰ ${escapeMarkdown(timeLabel)} - ` : '• ';
-    const locStr = task.location ? ` 📍 ${escapeMarkdown(task.location)}` : '';
-    const sourceStr = task.source === 'school_timetable' ? ' (School)' : '';
-    message += `${icon} ${timeStr}${escapeMarkdown(task.task)}${locStr}${sourceStr}\n`;
+  if (assignments.length > 0) {
+    message += `\n📝 *Assignments & Deadlines*\n`;
+    message += renderItems(assignments);
   }
 
-  return bot.sendMessage(chatId, message.trim(), { parse_mode: 'Markdown' });
+  if (otherTasks.length > 0) {
+    message += `\n✅ *Tasks*\n`;
+    message += renderItems(otherTasks);
+  }
+
+  if (classes.length > 0) {
+    message += `\n📚 *Classes*\n`;
+    message += renderItems(classes, { isSchool: true });
+  }
+
+  return bot.sendMessage(chatId, message.trim(), { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() });
 }
 
 async function handleWeek(chatId) {
@@ -1284,30 +1362,45 @@ async function handleWeek(chatId) {
   const tasks = await getEventsWithSchoolTimetable(chatId, isoDate(start), isoDate(end));
 
   if (tasks.length === 0) {
-    return bot.sendMessage(chatId, `📆 *Next 7 Days*\n\nNo tasks or classes this week!`, { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      `📆 *Next 7 Days*\n\nNo tasks or classes this week!`,
+      { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() }
+    );
+  }
+
+  const assignments = [];
+  const otherTasks = [];
+  const classes = [];
+
+  for (const item of tasks) {
+    if (item.source === 'school_timetable') {
+      classes.push(item);
+    } else if (item.type === 'assignment' || item.type === 'deadline') {
+      assignments.push(item);
+    } else {
+      otherTasks.push(item);
+    }
   }
 
   let message = `📆 *Next 7 Days*\n`;
-  let currentDate = null;
 
-  for (const task of tasks) {
-    if (task.date !== currentDate) {
-      currentDate = task.date;
-      message += `\n📅 *${escapeMarkdown(formatDate(task.date))}*\n`;
-    }
-
-    const icon = task.source === 'school_timetable' ? '📚' : getEventIcon(task.type);
-    let timeLabel = null;
-    if (task.start_time && task.end_time) timeLabel = `${task.start_time}-${task.end_time}`;
-    else if (task.start_time) timeLabel = task.start_time;
-
-    const timeStr = timeLabel ? `⏰ ${escapeMarkdown(timeLabel)} - ` : '• ';
-    const locStr = task.location ? ` 📍 ${escapeMarkdown(task.location)}` : '';
-    const sourceStr = task.source === 'school_timetable' ? ' (School)' : '';
-    message += `${icon} ${timeStr}${escapeMarkdown(task.task)}${locStr}${sourceStr}\n`;
+  if (assignments.length > 0) {
+    message += `\n📝 *Assignments & Deadlines*\n`;
+    message += renderItems(assignments);
   }
 
-  return bot.sendMessage(chatId, message.trim(), { parse_mode: 'Markdown' });
+  if (otherTasks.length > 0) {
+    message += `\n✅ *Tasks*\n`;
+    message += renderItems(otherTasks);
+  }
+
+  if (classes.length > 0) {
+    message += `\n📚 *Classes*\n`;
+    message += renderItems(classes, { isSchool: true });
+  }
+
+  return bot.sendMessage(chatId, message.trim(), { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() });
 }
 
 async function handleAll(chatId) {
@@ -1317,7 +1410,7 @@ async function handleAll(chatId) {
     ? `📋 *All Upcoming Tasks*\n${formatTaskList(tasks)}`
     : `📋 *All Upcoming Tasks*\n\nNo tasks scheduled!`;
 
-  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() });
 }
 
 async function handleNext(chatId) {
@@ -1353,7 +1446,75 @@ async function handleNext(chatId) {
     (timeLabel ? ` ⏰ ${escapeMarkdown(timeLabel)}` : '') +
     locStr;
 
-  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() });
+}
+
+// Show upcoming tasks and deadlines (non-class, non-event)
+async function handleTasks(chatId) {
+  const all = await getAllUpcomingEvents(chatId);
+  const now = new Date();
+
+  const upcoming = all
+    .map(t => {
+      const startTime = t.start_time || '23:59';
+      const dt = new Date(`${t.date}T${startTime}:00`);
+      return { ...t, _dt: dt };
+    })
+    .filter(t => !isNaN(t._dt) && t._dt >= now);
+
+  const taskItems = upcoming.filter(t =>
+    t.source !== 'school_timetable' &&
+    (t.type === 'assignment' || t.type === 'deadline' || t.type === 'task')
+  );
+
+  let message = '📝 *Upcoming Tasks & Deadlines*\n';
+
+  if (taskItems.length === 0) {
+    message += '\nNo upcoming tasks or deadlines!';
+  } else {
+    message += '\n' + formatTaskList(taskItems);
+  }
+
+  return bot.sendMessage(
+    chatId,
+    message.trim(),
+    { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() }
+  );
+}
+
+// Show upcoming non-class events (sports, social, meetings, etc.)
+async function handleEvents(chatId) {
+  const all = await getAllUpcomingEvents(chatId);
+  const now = new Date();
+
+  const upcoming = all
+    .map(t => {
+      const startTime = t.start_time || '23:59';
+      const dt = new Date(`${t.date}T${startTime}:00`);
+      return { ...t, _dt: dt };
+    })
+    .filter(t => !isNaN(t._dt) && t._dt >= now);
+
+  const eventItems = upcoming.filter(t =>
+    t.type !== 'assignment' &&
+    t.type !== 'deadline' &&
+    t.type !== 'task' &&
+    t.source !== 'school_timetable'
+  );
+
+  let message = '🎉 *Upcoming Events*\n';
+
+  if (eventItems.length === 0) {
+    message += '\nNo upcoming events!';
+  } else {
+    message += '\n' + formatTaskList(eventItems);
+  }
+
+  return bot.sendMessage(
+    chatId,
+    message.trim(),
+    { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() }
+  );
 }
 
 async function handleTimetable(chatId) {
@@ -1387,15 +1548,13 @@ async function handleTimetable(chatId) {
         const weeksLabel = entry.weeks_json
           ? ` (Weeks **${JSON.parse(entry.weeks_json).join(', ')}**)`
           : '';
-        message += `  [${entry.id}] ${escapeMarkdown(entry.start_time)}-${escapeMarkdown(entry.end_time)} ${escapeMarkdown(entry.subject)}${loc}${weeksLabel}\n`;
+        message += `  • ${escapeMarkdown(entry.start_time)}-${escapeMarkdown(entry.end_time)} ${escapeMarkdown(entry.subject)}${loc}${weeksLabel}\n`;
       }
       message += '\n';
     }
   }
 
-  message += `\nUse /deleteclass <id> to remove a class (e.g., /deleteclass 1)`;
-
-  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+  return bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: buildBackToMenuKeyboard() });
 }
 
 // =====================================================
@@ -1588,7 +1747,16 @@ bot.on('callback_query', async (query) => {
       if (action === 'week') return handleWeek(chatId);
       if (action === 'next') return handleNext(chatId);
       if (action === 'all') return handleAll(chatId);
+      if (action === 'tasks') return handleTasks(chatId);
+      if (action === 'events') return handleEvents(chatId);
       if (action === 'timetable') return handleTimetable(chatId);
+      if (action === 'home') {
+        return bot.sendMessage(
+          chatId,
+          '📱 *Main Menu*\n\nSelect an option:',
+          { parse_mode: 'Markdown', reply_markup: buildMainMenuKeyboard() }
+        );
+      }
 
       if (action === 'import_timetable') {
         const session = getSession(chatId);
